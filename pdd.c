@@ -6,12 +6,32 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <getopt.h>
 #include <ctype.h>
-#include <linux/fs.h>
 #include <sys/ioctl.h>
 #include <signal.h>
 #include <stdarg.h>
+
+/* Platform-specific includes and definitions */
+#ifdef HAVE_LINUX_FEATURES
+#include <linux/fs.h>
+#define HAVE_DIRECT_IO 1
+#define HAVE_BLOCK_SIZE_IOCTL 1
+#define IO_DIRECT_FLAG O_DIRECT
+#elif defined(__APPLE__)
+#include <sys/disk.h>
+#define HAVE_BLOCK_SIZE_IOCTL 1
+/* macOS doesn't have O_DIRECT */
+#define HAVE_DIRECT_IO 0
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#include <sys/disk.h>
+#define HAVE_BLOCK_SIZE_IOCTL 1
+#define HAVE_DIRECT_IO 1
+#define IO_DIRECT_FLAG O_DIRECT
+#else
+/* Unknown platform - use conservative defaults */
+#define HAVE_DIRECT_IO 0
+#define HAVE_BLOCK_SIZE_IOCTL 0
+#endif
 
 // constants
 #define DEFAULT_BLOCK_SIZE (128 * 1024)    // default block size (128KB)
@@ -93,9 +113,15 @@ static void cleanup_and_exit(int in_fd, int out_fd, void *buffer, const char *fm
 static size_t optimize_block_size(int fd);
 static int open_file(FileHandler *fh, const Options *opts);
 static void *allocate_aligned_buffer(size_t size);
+static void free_aligned_buffer(void *ptr);
+static int portable_flush_buffer(int fd, int is_output);
+#if HAVE_DIRECT_IO
+static int check_direct_io(int fd, void *buffer, size_t size);
+#endif
 static int copy_file(Options *opts);
-static void validate_options(const Options *opts);
+static void validate_options(Options *opts);
 static void print_usage(const char *program_name);
+static void print_platform_info(void);
 
 // signal handler implementation
 static void signal_handler(int signum)
@@ -271,7 +297,7 @@ static void cleanup_and_exit(int in_fd, int out_fd, void *buffer, const char *fm
 
     if (buffer)
     {
-        free(buffer);
+        free_aligned_buffer(buffer);
     }
     if (in_fd != -1)
     {
@@ -288,14 +314,38 @@ static void cleanup_and_exit(int in_fd, int out_fd, void *buffer, const char *fm
 static size_t optimize_block_size(int fd)
 {
     struct stat st;
+
+    // Check if file is a block device
     if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode))
     {
-        unsigned int physical_block_size;
-        if (ioctl(fd, BLKPBSZGET, &physical_block_size) == 0)
+#if HAVE_BLOCK_SIZE_IOCTL
+
+#ifdef HAVE_LINUX_FEATURES
+        unsigned int physical_block_size = 0;
+        // Linux-specific ioctl
+        if (ioctl(fd, BLKPBSZGET, &physical_block_size) == 0 && physical_block_size > 0)
         {
             return physical_block_size;
         }
+#elif defined(__APPLE__)
+        // macOS-specific ioctl
+        uint32_t block_size = 0;
+        if (ioctl(fd, DKIOCGETBLOCKSIZE, &block_size) == 0 && block_size > 0)
+        {
+            return block_size;
+        }
+#elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+        // BSD-specific ioctls
+        u_int block_size = 0;
+        if (ioctl(fd, DIOCGSECTORSIZE, &block_size) == 0 && block_size > 0)
+        {
+            return block_size;
+        }
+#endif
+#endif /* HAVE_BLOCK_SIZE_IOCTL */
     }
+
+    // Default to a reasonable block size if we can't determine device optimal size
     return DEFAULT_BLOCK_SIZE;
 }
 
@@ -309,10 +359,16 @@ static int open_file(FileHandler *fh, const Options *opts)
     }
 
     int flags = fh->is_input ? O_RDONLY : (O_WRONLY | O_CREAT | O_TRUNC);
+
+    // Add direct I/O flag if supported and requested
+#if HAVE_DIRECT_IO
     if (opts->direct_flag)
     {
-        flags |= O_DIRECT;
+        flags |= IO_DIRECT_FLAG;
     }
+#endif
+
+    // O_SYNC is defined in POSIX
     if (!fh->is_input && opts->sync_flag)
     {
         flags |= O_SYNC;
@@ -326,19 +382,128 @@ static int open_file(FileHandler *fh, const Options *opts)
 static void *allocate_aligned_buffer(size_t size)
 {
     void *buffer = NULL;
-    size_t page_size = sysconf(_SC_PAGESIZE);
+
+    // Get system page size for alignment
+    size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    if (page_size == (size_t)-1)
+    {
+        page_size = 4096; // Default if sysconf fails
+    }
     size_t alignment = (page_size > 4096) ? page_size : 4096;
 
-    // ensure size is aligned to boundary
+    // Ensure size is aligned to boundary
     size = (size + alignment - 1) & ~(alignment - 1);
 
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+    // Use posix_memalign() if available (POSIX.1-2001 and later)
     if (posix_memalign(&buffer, alignment, size) != 0)
     {
         return NULL;
     }
+#else
+    // Fallback: allocate extra space to ensure alignment
+    void *raw_mem = malloc(size + alignment);
+    if (raw_mem == NULL)
+    {
+        return NULL;
+    }
+
+    // Calculate aligned address
+    uintptr_t addr = (uintptr_t)raw_mem;
+    addr = (addr + alignment - 1) & ~(alignment - 1);
+
+    // Save original pointer for free()
+    void **saveptr = (void **)(addr - sizeof(void *));
+    *saveptr = raw_mem;
+
+    buffer = (void *)addr;
+#endif
 
     return buffer;
 }
+
+// free aligned memory buffer
+static void free_aligned_buffer(void *ptr)
+{
+    if (ptr == NULL)
+    {
+        return;
+    }
+
+#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
+    // If using posix_memalign(), just free
+    free(ptr);
+#else
+    // If using fallback method, retrieve original pointer
+    void **saveptr = (void **)((uintptr_t)ptr - sizeof(void *));
+    free(*saveptr);
+#endif
+}
+
+// portable buffer flushing function
+static int portable_flush_buffer(int fd, int is_output)
+{
+    if (fd < 0 || !is_output)
+    {
+        return 0; // Nothing to do for invalid fd or input files
+    }
+
+    int result = 0;
+
+#ifdef HAVE_LINUX_FEATURES
+    // Linux-specific: data sync for output files only
+    result = fdatasync(fd);
+#else
+    // Portable fallback: full sync
+    result = fsync(fd);
+#endif
+
+    return result;
+}
+
+// check if direct I/O is actually working
+#if HAVE_DIRECT_IO
+static int check_direct_io(int fd, void *buffer, size_t size)
+{
+#if HAVE_DIRECT_IO
+    // Try a small write with direct I/O
+    char test_file[] = "/tmp/pdd-direct-test-XXXXXX";
+    int test_fd = mkstemp(test_file);
+
+    if (test_fd < 0)
+    {
+        return 0; // Failed to create test file
+    }
+
+    // Set O_DIRECT on the test file
+    int flags = fcntl(test_fd, F_GETFL);
+    if (flags < 0)
+    {
+        close(test_fd);
+        unlink(test_file);
+        return 0;
+    }
+
+    int result = 0;
+#if defined(IO_DIRECT_FLAG)
+    if (fcntl(test_fd, F_SETFL, flags | IO_DIRECT_FLAG) >= 0)
+    {
+        // Try writing to the file - if this succeeds, direct I/O works
+        if (write(test_fd, buffer, size) == (ssize_t)size)
+        {
+            result = 1;
+        }
+    }
+#endif
+
+    close(test_fd);
+    unlink(test_file);
+    return result;
+#else
+    return 0; // Direct I/O not supported by platform
+#endif
+}
+#endif
 
 // main copy operation
 static int copy_file(Options *opts)
@@ -407,7 +572,7 @@ static int copy_file(Options *opts)
 
         if (opts->fsync_flag)
         {
-            HANDLE_ERROR(fsync(out_file.fd) == -1,
+            HANDLE_ERROR(portable_flush_buffer(out_file.fd, 1) == -1,
                          in_file.fd, out_file.fd, buffer, "error syncing");
         }
 
@@ -430,7 +595,7 @@ static int copy_file(Options *opts)
            "MB", stats.elapsed_time,
            (double)stats.total_bytes_copied / MEGABYTE / stats.elapsed_time);
 
-    free(buffer);
+    free_aligned_buffer(buffer);
     close(in_file.fd);
     close(out_file.fd);
     return EXIT_SUCCESS;
@@ -487,6 +652,12 @@ static void handle_fsync(Options *opts, const char *value)
     opts->fsync_flag = 1;
 }
 
+static void handle_platform(Options *opts, const char *value)
+{
+    print_platform_info();
+    exit(EXIT_SUCCESS);
+}
+
 // option handler table
 static const OptionHandler option_handlers[] = {
     {"if", handle_if},
@@ -498,6 +669,7 @@ static const OptionHandler option_handlers[] = {
     {"sync", handle_sync},
     {"direct", handle_direct},
     {"fsync", handle_fsync},
+    {"platform", handle_platform},
     {NULL, NULL}};
 
 // parse command line options
@@ -525,7 +697,7 @@ static int parse_option(Options *opts, const char *arg)
 }
 
 // validate input options
-static void validate_options(const Options *opts)
+static void validate_options(Options *opts)
 {
     if (opts->block_size == 0)
     {
@@ -533,11 +705,36 @@ static void validate_options(const Options *opts)
         exit(EXIT_FAILURE);
     }
 
-    if (opts->direct_flag && (opts->block_size % 512) != 0)
+#if HAVE_DIRECT_IO
+    if (opts->direct_flag)
     {
-        fprintf(stderr, "warning: block size %zu is not a multiple of 512 for direct I/O\n",
-                opts->block_size);
+        // Check if block size is appropriate for direct I/O
+        if ((opts->block_size % 512) != 0)
+        {
+            fprintf(stderr, "warning: block size %zu is not a multiple of 512 for direct I/O\n",
+                    opts->block_size);
+        }
+
+        // Perform a test to see if direct I/O actually works
+        void *test_buffer = allocate_aligned_buffer(opts->block_size);
+        if (test_buffer)
+        {
+            if (!check_direct_io(-1, test_buffer, opts->block_size))
+            {
+                fprintf(stderr, "warning: direct I/O was requested but might not work on this platform\n");
+                fprintf(stderr, "         falling back to buffered I/O\n");
+                opts->direct_flag = 0;
+            }
+            free_aligned_buffer(test_buffer);
+        }
     }
+#else
+    if (opts->direct_flag)
+    {
+        fprintf(stderr, "warning: direct I/O is not supported on this platform, ignoring direct flag\n");
+        opts->direct_flag = 0;
+    }
+#endif
 
     if (strcmp(opts->if_path, opts->of_path) == 0 &&
         strcmp(opts->if_path, "-") != 0)
@@ -560,18 +757,47 @@ static void print_usage(const char *program_name)
     fprintf(stderr, "  skip=N         skip N input blocks at start\n");
     fprintf(stderr, "  seek=N         skip N output blocks at start\n");
     fprintf(stderr, "  sync           use synchronized I/O for data\n");
-    fprintf(stderr, "  direct         use direct I/O\n");
+    fprintf(stderr, "  direct         use direct I/O (if supported)\n");
     fprintf(stderr, "  fsync          perform fsync after each write\n");
+    fprintf(stderr, "  platform       show platform-specific capabilities\n");
     fprintf(stderr, "\nSize suffixes: K=1024, M=1024*1024, G=1024*1024*1024\n");
+}
+
+// print platform capabilities and configuration
+static void print_platform_info(void)
+{
+    printf("pdd - POSIX platform capabilities:\n");
+
+#ifdef __APPLE__
+    printf("Platform: macOS\n");
+#elif defined(HAVE_LINUX_FEATURES)
+    printf("Platform: Linux\n");
+#elif defined(__FreeBSD__)
+    printf("Platform: FreeBSD\n");
+#elif defined(__NetBSD__)
+    printf("Platform: NetBSD\n");
+#elif defined(__OpenBSD__)
+    printf("Platform: OpenBSD\n");
+#else
+    printf("Platform: POSIX compatible\n");
+#endif
+
+    printf("Direct I/O support: %s\n", HAVE_DIRECT_IO ? "Yes" : "No");
+    printf("Block device size detection: %s\n", HAVE_BLOCK_SIZE_IOCTL ? "Yes" : "No");
+    printf("Default block size: %lu bytes\n", (unsigned long)DEFAULT_BLOCK_SIZE);
+    printf("Maximum block size: %lu bytes\n", (unsigned long)MAX_BLOCK_SIZE);
+    printf("\n");
 }
 
 // main function
 int main(int argc, char *argv[])
 {
+    // Show usage but don't exit as failure when no arguments provided
+    // This allows piping data through pdd without parameters
     if (argc < 2)
     {
         print_usage(argv[0]);
-        return EXIT_FAILURE;
+        fprintf(stderr, "\nNo options specified, will copy stdin to stdout with default settings.\n\n");
     }
 
     Options opts = {

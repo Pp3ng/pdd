@@ -1,6 +1,18 @@
 CC = gcc
-CFLAGS = -O2 -Wall -D_GNU_SOURCE
+CFLAGS = -O3 -Wall -pedantic
 LDFLAGS =
+
+# Platform detection
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Linux)
+    CFLAGS += -D_GNU_SOURCE -D_POSIX_C_SOURCE=200809L -DHAVE_LINUX_FEATURES
+endif
+ifeq ($(UNAME_S),Darwin)
+    CFLAGS += -D_DARWIN_C_SOURCE
+endif
+ifeq ($(UNAME_S),FreeBSD)
+    CFLAGS += -D_BSD_SOURCE
+endif
 
 TARGET = pdd
 SRC = pdd.c

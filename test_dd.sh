@@ -10,6 +10,25 @@ NC='\033[0m' # No Color
 total_tests=0
 passed_tests=0
 
+# Function to get file size in a cross-platform way
+get_file_size() {
+    local file=$1
+    
+    if [[ "$(uname)" == "Darwin" ]]; then
+        # macOS
+        stat -f%z "$file"
+    elif [[ "$(uname)" == "Linux" ]]; then
+        # Linux
+        stat -c %s "$file"
+    elif [[ "$(uname)" == "FreeBSD" || "$(uname)" == "NetBSD" || "$(uname)" == "OpenBSD" ]]; then
+        # BSD
+        stat -f %z "$file"
+    else
+        # Fallback using ls -l (less accurate but more portable)
+        ls -l "$file" | awk '{print $5}'
+    fi
+}
+
 # function to verify files using md5sum
 verify_files() {
     local file1=$1
@@ -159,7 +178,7 @@ run_test "block count" \
 
 # Test 5: Verify partial copy size
 run_test "partial copy size verification" \
-    "test $(stat -c %s output3.bin) -eq $((5*1024*1024))" \
+    "test \$(get_file_size output3.bin) -eq $((5*1024*1024))" \
     "success"
 
 # Test 6: Skip input blocks
@@ -204,7 +223,7 @@ run_test "fsync after each write" \
 
 # Test 14: Verify seek creates sparse file
 run_test "sparse file creation" \
-    "(../pdd if=input.bin of=output13.bin bs=1M seek=10 count=1 && [ -f output13.bin ] && [ \$(stat -c %s output13.bin) -eq \$((11*1024*1024)) ])" \
+    "(../pdd if=input.bin of=output13.bin bs=1M seek=10 count=1 && [ -f output13.bin ] && [ \$(get_file_size output13.bin) -eq \$((11*1024*1024)) ])" \
     "success"
 
 # Print functionality test summary
