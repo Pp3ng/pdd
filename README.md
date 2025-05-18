@@ -1,6 +1,6 @@
 # pdd
 
-A modern, portable implementation of the classic Unix `dd` command, focusing on reliability, performance, and user experience across POSIX-compliant operating systems.
+A modern, POSIX-compatible implementation of the classic Unix `dd` command, designed to be portable and user-friendly. It provides a real-time progress bar, automatic block size optimization, and improved error handling over the traditional `dd` command.
 
 ## Features
 
@@ -14,19 +14,6 @@ A modern, portable implementation of the classic Unix `dd` command, focusing on 
 - Graceful termination handling
 - Platform-aware memory-aligned buffers for optimal performance
 - Minimum block size of 512 bytes
-
-## Improvements over dd
-
-- Real-time progress bar showing:
-  - Percentage complete
-  - Current transfer speed
-  - Amount of data copied
-  - Estimated time remaining (ETA)
-- More detailed error messages with errno information
-- Automatic block size optimization
-- Human-readable size units
-- Graceful handling of Ctrl+C
-- Better parameter validation and warnings
 
 ## Building
 
@@ -96,34 +83,6 @@ Backup MBR:
 ```bash
 ./pdd if=/dev/sda of=mbr.img bs=512 count=1
 ```
-
-## Performance
-
-- Default block size optimized to 128KB for good performance across platforms
-- Direct I/O support on Linux and BSD for better performance with block devices
-- Optimized memory-aligned buffers for all supported platforms
-- Platform-specific block device detection and optimization
-- Efficient portable buffer flushing mechanism
-- Performance comparable to or better than system dd in most cases
-
-## Error Handling
-
-- All I/O errors are reported with detailed error messages
-- Signal handling allows for graceful termination (Ctrl+C)
-- Proper cleanup of resources on error conditions
-- Platform-aware aligned memory allocation for optimal I/O performance
-- Parameter validation with helpful error messages
-- Platform capability detection with clear warnings
-
-## Limitations
-
-- Maximum block size is 128MB
-- Direct I/O not available on macOS (platform limitation)
-- Some specialized features are platform-dependent (but the program will warn you appropriately)
-- Minimum block size is 512 bytes
-- No conv options supported
-- No status=noxfer option
-- No iflag/oflag options
 
 ## Contributing
 
