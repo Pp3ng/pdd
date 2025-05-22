@@ -35,12 +35,12 @@
 #define HAVE_BLOCK_SIZE_IOCTL 0
 #endif
 
-// constants
 #define DEFAULT_BLOCK_SIZE (128 * 1024)    // 128 KB
 #define MAX_BLOCK_SIZE (128 * 1024 * 1024) // 128 MB
 #define MIN_BLOCK_SIZE (512)               // 512 B
 #define DEFAULT_BAR_WIDTH 20               // progress bar width
-#define MEGABYTE (1024 * 1024)
+#define MEGABYTE (1024 * 1024)             // 1 MB
+#define PROGRESS_SLEEP_USEC 100000         // 100 ms
 
 // size suffixes for human-readable output
 typedef enum
@@ -53,8 +53,6 @@ typedef enum
 } SizeUnit;
 
 static const char *UNIT_STRINGS[] = {"B", "KB", "MB", "GB", "TB"};
-
-// type definitions
 
 typedef struct
 {
@@ -100,8 +98,6 @@ typedef struct
     void (*handler)(Options *, const char *); // option handler function
 } OptionHandler;
 
-// global variables
-
 // flag for handling interruptions gracefully
 static volatile sig_atomic_t stop_requested = 0;
 
@@ -112,8 +108,6 @@ typedef struct
     size_t total_bytes;        // total bytes to copy
     atomic_bool copy_finished; // indicates copy operation finished (atomic)
 } ProgressThreadData;
-
-// function prototypes
 
 // signal and initialization
 static void signal_handler(int signum);
@@ -132,7 +126,6 @@ static void *progress_thread_func(void *arg);
 static void init_progress_thread_data(ProgressThreadData *data, CopyStats *stats, size_t total_bytes);
 
 // memory and I/O operations
-static void cleanup_and_exit(int in_fd, int out_fd, void *buffer, const char *fmt, ...);
 static size_t optimize_block_size(int fd);
 static int open_file(FileHandler *fh, const Options *opts);
 static void *allocate_aligned_buffer(size_t size);
@@ -160,18 +153,65 @@ static void handle_direct(Options *opts, const char *value);
 static void handle_fsync(Options *opts, const char *value);
 static void handle_platform(Options *opts, const char *value);
 
-// error handling macro
-#define HANDLE_ERROR(condition, in_fd, out_fd, buf, ...)       \
-    do                                                         \
-    {                                                          \
-        if (condition)                                         \
-        {                                                      \
-            cleanup_and_exit(in_fd, out_fd, buf, __VA_ARGS__); \
-            return EXIT_FAILURE;                               \
-        }                                                      \
-    } while (0)
+typedef struct
+{
+    int in_fd;
+    int out_fd;
+    void *buffer;
+} ManagedResources;
 
-// signal handling
+static void managed_resources_init(ManagedResources *res)
+{
+    res->in_fd = -1;
+    res->out_fd = -1;
+    res->buffer = NULL;
+}
+
+static void managed_resources_destroy(ManagedResources *res)
+{
+    if (res->buffer)
+    {
+        free_aligned_buffer(res->buffer);
+        res->buffer = NULL;
+    }
+    if (res->in_fd >= 0 && res->in_fd != STDIN_FILENO)
+    {
+        close(res->in_fd);
+        res->in_fd = -1;
+    }
+    if (res->out_fd >= 0 && res->out_fd != STDOUT_FILENO)
+    {
+        close(res->out_fd);
+        res->out_fd = -1;
+    }
+}
+
+static void error_exit(ManagedResources *res, const char *fmt, ...)
+{
+    if (fmt)
+    {
+        va_list args;
+        fprintf(stderr, "\nerror: ");
+        va_start(args, fmt);
+        vfprintf(stderr, fmt, args);
+        va_end(args);
+        if (errno)
+            fprintf(stderr, ": %s (errno=%d)", strerror(errno), errno);
+        fprintf(stderr, "\n");
+    }
+    managed_resources_destroy(res);
+    exit(EXIT_FAILURE);
+}
+
+#define HANDLE_ERROR(condition, res, ...) \
+    do                                    \
+    {                                     \
+        if (condition)                    \
+        {                                 \
+            error_exit(res, __VA_ARGS__); \
+            return EXIT_FAILURE;          \
+        }                                 \
+    } while (0)
 
 // signal handler for graceful termination
 static void signal_handler(int signum)
@@ -192,8 +232,6 @@ static void setup_signals(void)
     sigaction(SIGHUP, &sa, NULL);
     sigaction(SIGPIPE, &sa, NULL);
 }
-
-// size and formatting utilities
 
 // parse a size string with optional unit suffix (K, M, G)
 static size_t parse_size(const char *str)
@@ -239,8 +277,6 @@ static void format_size(char *buf, size_t bufsize, double size)
     snprintf(buf, bufsize, "%.2f %s", size, UNIT_STRINGS[unit]);
 }
 
-// progress tracking
-
 // initialize copy statistics
 static void init_copy_stats(CopyStats *stats)
 {
@@ -263,9 +299,7 @@ static void update_copy_stats(CopyStats *stats)
 static void calculate_progress(ProgressInfo *info, const CopyStats *stats, size_t total_bytes)
 {
     if (stats->elapsed_time < 0.1)
-    {
         return;
-    }
 
     info->bar_width = DEFAULT_BAR_WIDTH;
 
@@ -317,8 +351,6 @@ static void display_progress(const ProgressInfo *info)
     fflush(stdout);
 }
 
-#define PROGRESS_SLEEP_USEC 100000
-
 // initialize the thread data structure for progress monitoring
 static void init_progress_thread_data(ProgressThreadData *data, CopyStats *stats, size_t total_bytes)
 {
@@ -345,37 +377,6 @@ static void *progress_thread_func(void *arg)
     return NULL;
 }
 
-// memory and I/O operations
-
-// clean up resources and exit with error message
-static void cleanup_and_exit(int in_fd, int out_fd, void *buffer, const char *fmt, ...)
-{
-    if (fmt)
-    {
-        va_list args;
-        fprintf(stderr, "\nerror: ");
-        va_start(args, fmt);
-        vfprintf(stderr, fmt, args);
-        va_end(args);
-
-        if (errno)
-        {
-            fprintf(stderr, ": %s (errno=%d)", strerror(errno), errno);
-        }
-
-        fprintf(stderr, "\n");
-    }
-
-    if (buffer)
-        free_aligned_buffer(buffer);
-    if (in_fd >= 0 && in_fd != STDIN_FILENO)
-        close(in_fd);
-    if (out_fd >= 0 && out_fd != STDOUT_FILENO)
-        close(out_fd);
-
-    exit(EXIT_FAILURE);
-}
-
 // determine optimal block size for device
 static size_t optimize_block_size(int fd)
 {
@@ -390,23 +391,17 @@ static size_t optimize_block_size(int fd)
         unsigned int block_size = 0;
         // linux-specific ioctl
         if (ioctl(fd, BLKPBSZGET, &block_size) == 0 && block_size > 0)
-        {
             return block_size;
-        }
 #elif defined(__APPLE__)
         // macOS-specific ioctl
         uint32_t block_size = 0;
         if (ioctl(fd, DKIOCGETBLOCKSIZE, &block_size) == 0 && block_size > 0)
-        {
             return block_size;
-        }
 #elif defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
         // BSD-specific ioctls
         u_int block_size = 0;
         if (ioctl(fd, DIOCGSECTORSIZE, &block_size) == 0 && block_size > 0)
-        {
             return block_size;
-        }
 #endif
 #endif
     }
@@ -435,9 +430,7 @@ static int open_file(FileHandler *fh, const Options *opts)
 
     // add sync flag if requested for output files
     if (!fh->is_input && opts->sync_flag)
-    {
         flags |= O_SYNC;
-    }
 
     fh->fd = open(fh->path, flags, fh->is_input ? 0 : 0666);
     return fh->fd == -1 ? -1 : 0;
@@ -451,9 +444,8 @@ static void *allocate_aligned_buffer(size_t size)
     // get system page size for alignment
     size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
     if (page_size == (size_t)-1)
-    {
         page_size = 4096; // default if sysconf fails
-    }
+
     size_t alignment = (page_size > 4096) ? page_size : 4096;
 
     // ensure size is aligned to boundary
@@ -494,74 +486,83 @@ static int flush_buffer(int fd, bool is_output)
     return result;
 }
 
-// core functionality
+// ensure all bytes are read or an error occurs
+static ssize_t robust_read(int fd, void *buf, size_t nbytes)
+{
+    size_t total = 0;
+    char *p = (char *)buf;
+    while (total < nbytes)
+    {
+        ssize_t r = read(fd, p + total, nbytes - total);
+        if (r == 0)
+            break; // EOF
+        if (r < 0)
+            return (total > 0) ? total : -1;
+        total += r;
+    }
+    return total;
+}
+
+// ensure all bytes are written or an error occurs
+static ssize_t robust_write(int fd, const void *buf, size_t nbytes)
+{
+    size_t total = 0;
+    const char *p = (const char *)buf;
+    while (total < nbytes)
+    {
+        ssize_t w = write(fd, p + total, nbytes - total);
+        if (w < 0)
+            return -1;
+        total += w;
+    }
+    return total;
+}
 
 // copy data from input file to output file
 static int copy_file(Options *opts)
 {
+    ManagedResources res;
+    managed_resources_init(&res);
+
     FileHandler in_file = {
         .path = opts->if_path,
         .is_input = true};
-
     FileHandler out_file = {
         .path = opts->of_path,
         .is_input = false};
-
     CopyStats stats;
     init_copy_stats(&stats);
 
-    // open input file
-    HANDLE_ERROR(open_file(&in_file, opts) == -1,
-                 -1, -1, NULL, "error opening input file '%s'", opts->if_path);
+    HANDLE_ERROR(open_file(&in_file, opts) == -1 || open_file(&out_file, opts) == -1, &res,
+                 "error opening input file '%s' or output file '%s'", opts->if_path, opts->of_path);
+    res.in_fd = in_file.fd;
+    res.out_fd = out_file.fd;
 
-    // open output file
-    HANDLE_ERROR(open_file(&out_file, opts) == -1,
-                 in_file.fd, -1, NULL, "error opening output file '%s'", opts->of_path);
-
-    // optimize block size if not specified
     if (opts->block_size == 0)
-    {
-        opts->block_size = optimize_block_size(in_file.fd);
-    }
+        opts->block_size = optimize_block_size(res.in_fd);
 
-    // allocate aligned buffer
-    void *buffer = allocate_aligned_buffer(opts->block_size);
-    HANDLE_ERROR(!buffer, in_file.fd, out_file.fd, NULL,
+    HANDLE_ERROR(!(res.buffer = allocate_aligned_buffer(opts->block_size)), &res,
                  "error allocating aligned memory of size %zu", opts->block_size);
 
-    // handle skip and seek
     if (opts->skip > 0)
-    {
-        HANDLE_ERROR(lseek(in_file.fd, opts->skip * opts->block_size, SEEK_SET) == -1,
-                     in_file.fd, out_file.fd, buffer, "error skipping input blocks");
-    }
-
+        HANDLE_ERROR(lseek(res.in_fd, opts->skip * opts->block_size, SEEK_SET) == -1,
+                     &res, "error skipping input blocks");
     if (opts->seek > 0)
-    {
-        HANDLE_ERROR(lseek(out_file.fd, opts->seek * opts->block_size, SEEK_SET) == -1,
-                     in_file.fd, out_file.fd, buffer, "error seeking output blocks");
-    }
+        HANDLE_ERROR(lseek(res.out_fd, opts->seek * opts->block_size, SEEK_SET) == -1,
+                     &res, "error seeking output blocks");
 
-    // determine total bytes for progress calculation
     size_t total_bytes = 0;
     if (opts->count > 0)
-    {
         total_bytes = opts->count * opts->block_size;
-    }
-    else if (in_file.fd != STDIN_FILENO)
+    else if (res.in_fd != STDIN_FILENO)
     {
-        // try to get file size for progress reporting
         struct stat st;
-        if (fstat(in_file.fd, &st) == 0 && S_ISREG(st.st_mode))
-        {
+        if (fstat(res.in_fd, &st) == 0 && S_ISREG(st.st_mode))
             total_bytes = st.st_size;
-        }
     }
 
-    // set up progress thread
     ProgressThreadData thread_data;
     init_progress_thread_data(&thread_data, &stats, total_bytes);
-
     pthread_t progress_thread;
     int thread_result = pthread_create(&progress_thread, NULL, progress_thread_func, &thread_data);
     bool thread_active = (thread_result == 0);
@@ -569,60 +570,42 @@ static int copy_file(Options *opts)
     // main copy loop
     while (!stop_requested && (opts->count == 0 || stats.blocks_copied < opts->count))
     {
-        ssize_t bytes_read = read(in_file.fd, buffer, opts->block_size);
+        ssize_t bytes_read = robust_read(res.in_fd, res.buffer, opts->block_size);
         if (bytes_read == 0)
-        {
-            break; // end of file
-        }
-
-        HANDLE_ERROR(bytes_read == -1,
-                     in_file.fd, out_file.fd, buffer, "error reading");
-
-        ssize_t bytes_written = write(out_file.fd, buffer, bytes_read);
-        HANDLE_ERROR(bytes_written != bytes_read,
-                     in_file.fd, out_file.fd, buffer, "error writing");
-
+            break; // EOF
+        HANDLE_ERROR(bytes_read < 0, &res, "error reading");
+        ssize_t bytes_written = robust_write(res.out_fd, res.buffer, bytes_read);
+        HANDLE_ERROR(bytes_written != bytes_read, &res, "error writing");
         if (opts->fsync_flag)
         {
-            HANDLE_ERROR(flush_buffer(out_file.fd, true) == -1,
-                         in_file.fd, out_file.fd, buffer, "error syncing");
+            HANDLE_ERROR(flush_buffer(res.out_fd, true) == -1, &res, "error syncing");
         }
-
         stats.total_bytes_copied += bytes_read;
         stats.blocks_copied++;
     }
 
-    // signal progress thread that copy is complete
     if (thread_active)
     {
         atomic_store(&thread_data.copy_finished, true);
-
-        // wait for progress thread to finish
         pthread_join(progress_thread, NULL);
     }
 
-    // final progress update and summary
     printf("\n%zu+0 records in\n", stats.blocks_copied);
     printf("%zu+0 records out\n", stats.blocks_copied);
-
     char size_str[32];
     format_size(size_str, sizeof(size_str), stats.total_bytes_copied);
-
-    // avoid division by zero
     update_copy_stats(&stats);
     double speed_mb_per_second = 0.0;
     if (stats.elapsed_time > 0.001) // at least 1ms
         speed_mb_per_second = (double)stats.total_bytes_copied / MEGABYTE / stats.elapsed_time;
     else
-        speed_mb_per_second = 9999.99; // assume 10GB/s for very fast operations
+        speed_mb_per_second = 9999.99; // assume 10GB/s for very fast systems
 
     printf("%.2f %s copied, %.2f seconds, %.2f MB/s\n",
            (double)stats.total_bytes_copied / MEGABYTE,
            "MB", stats.elapsed_time, speed_mb_per_second);
 
-    free_aligned_buffer(buffer);
-    close(in_file.fd);
-    close(out_file.fd);
+    managed_resources_destroy(&res);
     return EXIT_SUCCESS;
 }
 
@@ -705,9 +688,7 @@ static int parse_option(Options *opts, const char *arg)
     const OptionHandler *handler = option_handlers;
 
     if (value)
-    {
         *value++ = '\0';
-    }
 
     while (handler->name != NULL)
     {
