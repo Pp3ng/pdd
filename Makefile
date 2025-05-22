@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -O3 -Wall -pedantic
-LDFLAGS =
+LDFLAGS = -pthread
 
 # Platform detection
 UNAME_S := $(shell uname -s)

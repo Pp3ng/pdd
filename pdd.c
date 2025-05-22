@@ -12,8 +12,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdbool.h>
-
-// platform-specific includes
+#include <pthread.h>
+#include <stdatomic.h>
 
 #ifdef HAVE_LINUX_FEATURES
 #include <linux/fs.h>
@@ -31,18 +31,15 @@
 #define HAVE_DIRECT_IO 1
 #define IO_DIRECT_FLAG O_DIRECT
 #else
-// unknown platform - use conservative defaults
 #define HAVE_DIRECT_IO 0
 #define HAVE_BLOCK_SIZE_IOCTL 0
 #endif
 
 // constants
-
 #define DEFAULT_BLOCK_SIZE (128 * 1024)    // 128 KB
 #define MAX_BLOCK_SIZE (128 * 1024 * 1024) // 128 MB
 #define MIN_BLOCK_SIZE (512)               // 512 B
 #define DEFAULT_BAR_WIDTH 20               // progress bar width
-#define UPDATE_INTERVAL 10000              // 10ms in microseconds
 #define MEGABYTE (1024 * 1024)
 
 // size suffixes for human-readable output
@@ -108,6 +105,14 @@ typedef struct
 // flag for handling interruptions gracefully
 static volatile sig_atomic_t stop_requested = 0;
 
+// progress tracking thread control
+typedef struct
+{
+    CopyStats *stats;          // copy statistics (shared)
+    size_t total_bytes;        // total bytes to copy
+    atomic_bool copy_finished; // indicates copy operation finished (atomic)
+} ProgressThreadData;
+
 // function prototypes
 
 // signal and initialization
@@ -123,6 +128,8 @@ static void init_copy_stats(CopyStats *stats);
 static void update_copy_stats(CopyStats *stats);
 static void calculate_progress(ProgressInfo *info, const CopyStats *stats, size_t total_bytes);
 static void display_progress(const ProgressInfo *info);
+static void *progress_thread_func(void *arg);
+static void init_progress_thread_data(ProgressThreadData *data, CopyStats *stats, size_t total_bytes);
 
 // memory and I/O operations
 static void cleanup_and_exit(int in_fd, int out_fd, void *buffer, const char *fmt, ...);
@@ -131,9 +138,6 @@ static int open_file(FileHandler *fh, const Options *opts);
 static void *allocate_aligned_buffer(size_t size);
 static void free_aligned_buffer(void *ptr);
 static int flush_buffer(int fd, bool is_output);
-#if HAVE_DIRECT_IO
-static bool check_direct_io(int fd, void *buffer, size_t size);
-#endif
 
 // core functionality
 static int copy_file(Options *opts);
@@ -198,28 +202,27 @@ static size_t parse_size(const char *str)
     size_t value = strtoull(str, &endptr, 10);
 
     if (endptr == str)
-    {
         return 0;
+
+    static const struct
+    {
+        char suffix;
+        size_t multiplier;
+    } suffixes[] = {
+        {'\0', 1}, // no suffix
+        {'K', 1024},
+        {'M', 1024 * 1024},
+        {'G', 1024ULL * 1024 * 1024},
+        {'T', 1024ULL * 1024 * 1024 * 1024}};
+
+    char suffix = toupper(*endptr);
+    for (int i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++)
+    {
+        if (suffix == suffixes[i].suffix)
+            return value * suffixes[i].multiplier;
     }
 
-    switch (toupper(*endptr))
-    {
-    case 'K':
-        value *= 1024;
-        break;
-    case 'M':
-        value *= 1024 * 1024;
-        break;
-    case 'G':
-        value *= 1024 * 1024 * 1024;
-        break;
-    case '\0':
-        break;
-    default:
-        return 0;
-    }
-
-    return value;
+    return 0; // unknown suffix
 }
 
 // format size with appropriate unit (B, KB, MB, GB, TB)
@@ -288,65 +291,58 @@ static void calculate_progress(ProgressInfo *info, const CopyStats *stats, size_
 // display progress bar and statistics
 static void display_progress(const ProgressInfo *info)
 {
-    static struct timeval last_update = {0, 0};
-    static size_t update_count = 0;
-    struct timeval now;
-    gettimeofday(&now, NULL);
-
-    // throttle updates to avoid excessive screen refreshes
-    // but ensure at least some updates for fast operations
-    if (last_update.tv_sec != 0)
-    {
-        double elapsed = (now.tv_sec - last_update.tv_sec) * 1000000.0 +
-                         (now.tv_usec - last_update.tv_usec);
-
-        // allow more frequent updates early in the process
-        bool force_update = (update_count < 10) && (elapsed >= UPDATE_INTERVAL / 2);
-
-        if (elapsed < UPDATE_INTERVAL && !force_update)
-        {
-            return;
-        }
-    }
-    update_count++;
-    last_update = now;
-
     // clear line and move cursor to start
     printf("\r\033[K");
 
+    // calculate completed bar width (rounded)
+    int completed = (int)(info->bar_width * info->progress / 100.0 + 0.5);
+    if (completed > info->bar_width)
+        completed = info->bar_width;
+
     // print progress bar
     printf("[");
-    int completed = info->bar_width * info->progress / 100.0;
-
-    for (int i = 0; i < completed; i++)
-    {
-        printf("=");
-    }
-
+    if (completed > 0)
+        printf("%.*s", completed, "===================="); // up to DEFAULT_BAR_WIDTH
     if (completed < info->bar_width)
-    {
-        printf(">");
-        completed++;
-    }
-
-    for (int i = completed; i < info->bar_width; i++)
-    {
-        printf(" ");
-    }
-
-    // print statistics
+        printf(">%*s", info->bar_width - completed - 1, "");
+    else if (completed == info->bar_width)
+        ; // bar full, no arrow
     printf("] %3.0f%% | %8s | %8s/s",
            info->progress,
            info->size_str,
            info->speed_str);
-
     // show ETA if meaningful
     if (info->eta > 0 && info->progress < 99.9)
-    {
         printf(" | ETA: %.0fs", info->eta);
-    }
-
     fflush(stdout);
+}
+
+#define PROGRESS_SLEEP_USEC 100000
+
+// initialize the thread data structure for progress monitoring
+static void init_progress_thread_data(ProgressThreadData *data, CopyStats *stats, size_t total_bytes)
+{
+    data->stats = stats;
+    data->total_bytes = total_bytes;
+    atomic_init(&data->copy_finished, false);
+}
+
+// thread function to monitor and display progress
+static void *progress_thread_func(void *arg)
+{
+    ProgressThreadData *data = (ProgressThreadData *)arg;
+    ProgressInfo info = {0};
+    for (;;)
+    {
+        CopyStats stats_copy = *data->stats;
+        update_copy_stats(&stats_copy);
+        calculate_progress(&info, &stats_copy, data->total_bytes);
+        display_progress(&info);
+        if (atomic_load(&data->copy_finished))
+            break;
+        usleep(PROGRESS_SLEEP_USEC);
+    }
+    return NULL;
 }
 
 // memory and I/O operations
@@ -371,19 +367,11 @@ static void cleanup_and_exit(int in_fd, int out_fd, void *buffer, const char *fm
     }
 
     if (buffer)
-    {
         free_aligned_buffer(buffer);
-    }
-
-    if (in_fd != -1)
-    {
+    if (in_fd >= 0 && in_fd != STDIN_FILENO)
         close(in_fd);
-    }
-
-    if (out_fd != -1)
-    {
+    if (out_fd >= 0 && out_fd != STDOUT_FILENO)
         close(out_fd);
-    }
 
     exit(EXIT_FAILURE);
 }
@@ -471,30 +459,8 @@ static void *allocate_aligned_buffer(size_t size)
     // ensure size is aligned to boundary
     size = (size + alignment - 1) & ~(alignment - 1);
 
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-    // use posix_memalign() if available (POSIX.1-2001 and later)
     if (posix_memalign(&buffer, alignment, size) != 0)
-    {
         return NULL;
-    }
-#else
-    // fallback: allocate extra space to ensure alignment
-    void *raw_mem = malloc(size + alignment);
-    if (raw_mem == NULL)
-    {
-        return NULL;
-    }
-
-    // calculate aligned address
-    uintptr_t addr = (uintptr_t)raw_mem;
-    addr = (addr + alignment - 1) & ~(alignment - 1);
-
-    // save original pointer for free()
-    void **saveptr = (void **)(addr - sizeof(void *));
-    *saveptr = raw_mem;
-
-    buffer = (void *)addr;
-#endif
 
     return buffer;
 }
@@ -502,19 +468,9 @@ static void *allocate_aligned_buffer(size_t size)
 // free memory buffer allocated with allocate_aligned_buffer()
 static void free_aligned_buffer(void *ptr)
 {
-    if (ptr == NULL)
-    {
+    if (!ptr)
         return;
-    }
-
-#if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
-    // if using posix_memalign(), just free
     free(ptr);
-#else
-    // if using fallback method, retrieve original pointer
-    void **saveptr = (void **)((uintptr_t)ptr - sizeof(void *));
-    free(*saveptr);
-#endif
 }
 
 // flush buffer to disk
@@ -537,46 +493,6 @@ static int flush_buffer(int fd, bool is_output)
 
     return result;
 }
-
-// check if direct I/O is working
-#if HAVE_DIRECT_IO
-static bool check_direct_io(int fd, void *buffer, size_t size)
-{
-    // create temporary test file
-    char test_file[] = "/tmp/pdd-direct-test-XXXXXX";
-    int test_fd = mkstemp(test_file);
-
-    if (test_fd < 0)
-    {
-        return false; // failed to create test file
-    }
-
-    // set O_DIRECT on the test file
-    int flags = fcntl(test_fd, F_GETFL);
-    if (flags < 0)
-    {
-        close(test_fd);
-        unlink(test_file);
-        return false;
-    }
-
-    bool result = false;
-#if defined(IO_DIRECT_FLAG)
-    if (fcntl(test_fd, F_SETFL, flags | IO_DIRECT_FLAG) >= 0)
-    {
-        // try writing to the file - if this succeeds, direct I/O works
-        if (write(test_fd, buffer, size) == (ssize_t)size)
-        {
-            result = true;
-        }
-    }
-#endif
-
-    close(test_fd);
-    unlink(test_file);
-    return result;
-}
-#endif
 
 // core functionality
 
@@ -641,7 +557,14 @@ static int copy_file(Options *opts)
             total_bytes = st.st_size;
         }
     }
-    ProgressInfo progress = {0};
+
+    // set up progress thread
+    ProgressThreadData thread_data;
+    init_progress_thread_data(&thread_data, &stats, total_bytes);
+
+    pthread_t progress_thread;
+    int thread_result = pthread_create(&progress_thread, NULL, progress_thread_func, &thread_data);
+    bool thread_active = (thread_result == 0);
 
     // main copy loop
     while (!stop_requested && (opts->count == 0 || stats.blocks_copied < opts->count))
@@ -667,33 +590,15 @@ static int copy_file(Options *opts)
 
         stats.total_bytes_copied += bytes_read;
         stats.blocks_copied++;
-
-        // update stats and display progress
-        update_copy_stats(&stats);
-        calculate_progress(&progress, &stats, total_bytes);
-
-        // use an adaptive update frequency:
-        // - more frequent updates early in the process
-        // - less frequent updates later
-        static size_t display_interval = 1;
-        if (stats.blocks_copied <= 10 ||
-            stats.blocks_copied % display_interval == 0)
-        {
-            display_progress(&progress);
-
-            // gradually increase the interval as more blocks are processed
-            if (stats.blocks_copied >= 100)
-                display_interval = 10;
-            else if (stats.blocks_copied >= 1000)
-                display_interval = 100;
-        }
     }
 
-    // make sure progress bar is fully filled before showing summary
-    if (total_bytes > 0)
+    // signal progress thread that copy is complete
+    if (thread_active)
     {
-        progress.progress = 100.0;
-        display_progress(&progress);
+        atomic_store(&thread_data.copy_finished, true);
+
+        // wait for progress thread to finish
+        pthread_join(progress_thread, NULL);
     }
 
     // final progress update and summary
@@ -702,10 +607,18 @@ static int copy_file(Options *opts)
 
     char size_str[32];
     format_size(size_str, sizeof(size_str), stats.total_bytes_copied);
+
+    // avoid division by zero
+    update_copy_stats(&stats);
+    double speed_mb_per_second = 0.0;
+    if (stats.elapsed_time > 0.001) // at least 1ms
+        speed_mb_per_second = (double)stats.total_bytes_copied / MEGABYTE / stats.elapsed_time;
+    else
+        speed_mb_per_second = 9999.99; // assume 10GB/s for very fast operations
+
     printf("%.2f %s copied, %.2f seconds, %.2f MB/s\n",
            (double)stats.total_bytes_copied / MEGABYTE,
-           "MB", stats.elapsed_time,
-           (double)stats.total_bytes_copied / MEGABYTE / stats.elapsed_time);
+           "MB", stats.elapsed_time, speed_mb_per_second);
 
     free_aligned_buffer(buffer);
     close(in_file.fd);
@@ -783,7 +696,7 @@ static const OptionHandler option_handlers[] = {
     {"direct", handle_direct},
     {"fsync", handle_fsync},
     {"platform", handle_platform},
-    {NULL, NULL}};
+    {NULL, NULL}}; // mark end of table
 
 // parse a command-line option
 static int parse_option(Options *opts, const char *arg)
@@ -826,19 +739,6 @@ static void validate_options(Options *opts)
         {
             fprintf(stderr, "warning: block size %zu is not a multiple of 512 for direct I/O\n",
                     opts->block_size);
-        }
-
-        // test if direct I/O actually works
-        void *test_buffer = allocate_aligned_buffer(opts->block_size);
-        if (test_buffer)
-        {
-            if (!check_direct_io(-1, test_buffer, opts->block_size))
-            {
-                fprintf(stderr, "warning: direct I/O was requested but might not work on this platform\n");
-                fprintf(stderr, "         falling back to buffered I/O\n");
-                opts->direct_flag = false;
-            }
-            free_aligned_buffer(test_buffer);
         }
     }
 #else
@@ -884,7 +784,7 @@ static void print_platform_info(void)
 
 #ifdef __APPLE__
     printf("Platform: macOS\n");
-#elif defined(HAVE_LINUX_FEATURES)
+#elif defined(__linux__)
     printf("Platform: Linux\n");
 #elif defined(__FreeBSD__)
     printf("Platform: FreeBSD\n");
