@@ -469,9 +469,7 @@ static void free_aligned_buffer(void *ptr)
 static int flush_buffer(int fd, bool is_output)
 {
     if (fd < 0 || !is_output)
-    {
         return 0; // nothing to do for invalid fd or input files
-    }
 
     int result = 0;
 
@@ -577,9 +575,8 @@ static int copy_file(Options *opts)
         ssize_t bytes_written = robust_write(res.out_fd, res.buffer, bytes_read);
         HANDLE_ERROR(bytes_written != bytes_read, &res, "error writing");
         if (opts->fsync_flag)
-        {
             HANDLE_ERROR(flush_buffer(res.out_fd, true) == -1, &res, "error syncing");
-        }
+
         stats.total_bytes_copied += bytes_read;
         stats.blocks_copied++;
     }
@@ -743,7 +740,6 @@ static void validate_options(Options *opts)
 static void print_usage(const char *program_name)
 {
     fprintf(stderr, "Usage: %s [OPTION]...\n", program_name);
-    fprintf(stderr, "Copy a file with progress display.\n\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  if=FILE        read from FILE instead of stdin\n");
     fprintf(stderr, "  of=FILE        write to FILE instead of stdout\n");
@@ -786,17 +782,16 @@ static void print_platform_info(void)
 
 int main(int argc, char *argv[])
 {
-    // show usage but don't exit as failure when no arguments provided
     if (argc < 2)
     {
         print_usage(argv[0]);
-        fprintf(stderr, "\nNo options specified, will copy stdin to stdout with default settings.\n\n");
+        return EXIT_FAILURE;
     }
 
     // initialize options with defaults
     Options opts = {
-        .if_path = "-",
-        .of_path = "-",
+        .if_path = NULL,
+        .of_path = NULL,
         .block_size = DEFAULT_BLOCK_SIZE,
         .count = 0,
         .skip = 0,
